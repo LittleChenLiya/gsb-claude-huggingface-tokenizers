@@ -1,6 +1,8 @@
 #[cfg(feature = "normalizers")]
 pub mod bert;
 pub mod byte_level;
+#[cfg(feature = "normalizers")]
+pub mod mapping;
 pub mod metaspace;
 #[cfg(feature = "normalizers")]
 pub mod precompiled;
@@ -23,6 +25,14 @@ pub use crate::normalizers::strip::StripAccents;
 #[cfg(feature = "normalizers")]
 pub use crate::normalizers::unicode::{NFC, NFD, NFKC, NFKD, Nmt};
 pub use crate::normalizers::utils::Lowercase;
+
+/// Verification entry point and types for normalization char-span mappings. Only the table-backed
+/// Unicode normalizers bring the alignment tables this needs, hence the feature gate.
+#[cfg(feature = "normalizers")]
+pub use crate::normalizers::mapping::{
+    CharMapping, MappingError, MappingReport, UnicodeForm, char_mappings, check_normalization,
+    identity_mappings,
+};
 
 // `NormalizerWrapper`, its hand-written `Deserialize` (tagged, with an untagged legacy fallback)
 // and the `Sequence` normalizer that holds a `Vec<NormalizerWrapper>` live in `tk-convert`.

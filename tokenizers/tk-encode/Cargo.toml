@@ -88,3 +88,15 @@ assert_approx_eq = "1.1"
 tracing = "0.1"
 tracing-subscriber = "0.3.23"
 serde_json = "1.0"
+
+[[example]]
+name = "normalization_mapping_check"
+# It drives the table-backed Unicode normalizers and their alignment tables, which only exist
+# with `normalizers`. Declared rather than auto-discovered so a build without that feature still
+# passes `cargo clippy --all-targets`.
+required-features = ["normalizers"]
+
+[[test]]
+name = "normalization_mapping_check"
+# Same reason as the example: the check entry point is `normalizers`-gated.
+required-features = ["normalizers"]
