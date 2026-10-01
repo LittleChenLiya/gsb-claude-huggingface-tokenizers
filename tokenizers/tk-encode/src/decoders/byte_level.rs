@@ -35,6 +35,22 @@ impl Decoder for ByteLevelDecoder {
             .collect::<Vec<u8>>();
         Ok(vec![String::from_utf8_lossy(&toks).to_string()])
     }
+
+    /// Return the raw bytes of a token, bypassing the lossy UTF-8 conversion.
+    ///
+    /// This is what lets [`DecodeSegmentStream`](crate::decoders::DecodeSegmentStream) buffer a
+    /// half-character (e.g. the first byte of a multi-byte UTF-8 sequence) without emitting `�`.
+    fn decode_token_bytes(&self, token: &str) -> Result<Vec<u8>> {
+        Ok(token
+            .chars()
+            .try_fold(vec![], |mut acc, c| {
+                char_to_byte(c).map(|b| {
+                    acc.push(b);
+                    acc
+                })
+            })
+            .unwrap_or_else(|| token.as_bytes().to_vec()))
+    }
 }
 
 #[cfg(test)]

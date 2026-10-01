@@ -52,6 +52,21 @@ impl Decoder for ByteFallback {
 
         Ok(new_tokens)
     }
+
+    /// Return the raw bytes of a token, bypassing the byte-fallback buffering and lossy conversion.
+    ///
+    /// For `<0x61>` style tokens this returns the raw byte; for all other tokens it returns the
+    /// token's own bytes. This lets [`DecodeSegmentStream`](crate::decoders::DecodeSegmentStream)
+    /// buffer a half-character (e.g. the first byte of a multi-byte UTF-8 sequence) without
+    /// emitting `�`.
+    fn decode_token_bytes(&self, token: &str) -> Result<Vec<u8>> {
+        let bytes = if token.len() == 6 && token.starts_with("<0x") && token.ends_with('>') {
+            u8::from_str_radix(&token[3..5], 16).ok()
+        } else {
+            None
+        };
+        Ok(bytes.map(|b| vec![b]).unwrap_or_else(|| token.as_bytes().to_vec()))
+    }
 }
 
 #[cfg(test)]
