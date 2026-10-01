@@ -11,7 +11,7 @@ use crate::models::wordlevel::WordLevel;
 use crate::models::wordpiece::{PipelineWordPiece, WordPieceScratch};
 pub use crate::pipeline::encode_options::EncodeOptions;
 pub use crate::pipeline::encode_options::Override;
-use crate::utils::truncation::truncate_pair;
+use crate::utils::truncation::{TruncationSource, truncate_pair};
 use crate::{
     DecoderRuntime, PaddingParams, TruncationParams,
     models::bpe::{BpeScratch, PipelineBPE},
@@ -478,6 +478,8 @@ pub struct Encoding {
     pub(crate) type_ids: Option<Vec<u8>>,
     /// `None` if the encoding is not padded (mask is all ones)
     pub(crate) attention_mask: Option<Vec<u8>>,
+    /// Which input sequence(s) truncation cut to fit `max_length`; `None` when nothing was cut.
+    pub(crate) truncation_source: Option<TruncationSource>,
 }
 
 impl Encoding {
@@ -486,6 +488,7 @@ impl Encoding {
             ids: Vec::new(),
             type_ids: None,
             attention_mask: None,
+            truncation_source: None,
         }
     }
 
@@ -495,6 +498,7 @@ impl Encoding {
             ids,
             type_ids,
             attention_mask: None,
+            truncation_source: None,
         }
     }
 }
@@ -518,6 +522,12 @@ impl Encoding {
 
     pub fn attention_mask(&self) -> Option<&[u8]> {
         self.attention_mask.as_deref()
+    }
+
+    /// Which input sequence(s) lost tokens to truncation, if any. `None` when the
+    /// encoding was not truncated: no truncation configured, or the input already fit.
+    pub fn truncation_source(&self) -> Option<TruncationSource> {
+        self.truncation_source
     }
 }
 /// Iterator yields results in completion order
@@ -692,12 +702,14 @@ impl PipelineTokenizer {
             0
         };
         let truncation = self.resolve_truncation(&options.truncation);
-        let (s1, s2) = truncate_pair(s1, s2, truncation, num_added_specials)?;
-        Ok(if options.add_special_tokens {
+        let (s1, s2, truncation_source) = truncate_pair(s1, s2, truncation, num_added_specials)?;
+        let mut encoding = if options.add_special_tokens {
             template.post_process::<true>(s1, s2)
         } else {
             template.post_process::<false>(s1, s2)
-        })
+        };
+        encoding.truncation_source = truncation_source;
+        Ok(encoding)
     }
 
     /// Encode one sequence, appending its ids to `output`.
@@ -1448,6 +1460,218 @@ mod tests {
             .unwrap();
 
         assert_eq!(ids(&encoding), [CLS, 1, 2, 3, SEP]);
+    }
+
+    // The two specials `[CLS]`/`[SEP]` come out of the `max_length` 5 budget, leaving 3 of the 8
+    // tokens; the only sequence takes the cut, which is what the marker has to say.
+    #[test]
+    fn truncation_source_marks_single_sequence_with_specials() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(5, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(tokens(1..=8), None, &EncodeOptions::default())
+            .unwrap();
+
+        assert_eq!(ids(&encoding), [CLS, 1, 2, 3, SEP]);
+        assert_eq!(encoding.len(), 5);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::First));
+    }
+
+    // The pair template's 3 specials leave 5 of the `max_length` 8 budget; 8 + 8 tokens balance
+    // to 2 + 3, so both sides lost tokens and the final encoding is exactly `max_length` long.
+    #[test]
+    fn truncation_source_marks_both_sides_of_a_pair_with_specials() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(8, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(
+                tokens(1..=8),
+                Some(tokens(1..=8)),
+                &EncodeOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(ids(&encoding), [CLS, 1, 2, SEP, 1, 2, 3, SEP]);
+        assert_eq!(encoding.len(), 8);
+        assert_eq!(encoding.type_ids().unwrap(), [0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::Both));
+    }
+
+    #[test]
+    fn truncation_source_marks_a_truncated_single_sequence() {
+        let pipeline = hello_pipeline_with_truncation(truncate_to(2));
+
+        let encoding = encode_six_tokens(&pipeline, &EncodeOptions::default());
+
+        assert_eq!(ids(&encoding), [0, 0]);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::First));
+    }
+
+    // No marker when nothing was cut: input shorter than `max_length`, or no truncation
+    // configured at all. The ids are exactly what an encode without the feature produced.
+    #[test]
+    fn truncation_source_is_none_when_nothing_was_cut() {
+        let pipeline = hello_pipeline_with_truncation(truncate_to(2));
+
+        let encoding = pipeline
+            .encode("hello", &EncodeOptions::default())
+            .wait()
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(ids(&encoding), [7]);
+        assert_eq!(encoding.truncation_source(), None);
+
+        let pipeline = hello_pipeline();
+
+        let encoding = encode_six_tokens(&pipeline, &EncodeOptions::default());
+
+        assert_eq!(ids(&encoding), [0, 0, 0, 0, 0, 7]);
+        assert_eq!(encoding.truncation_source(), None);
+    }
+
+    // "hhhhhhello" is 6 tokens (five lone `h` and one `hello`), "hhhello" 3 ([h, h, hello]):
+    // 6 + 3 against a budget of 4 balances to 2 + 2, a cut on both sides.
+    #[test]
+    fn truncation_source_marks_both_sides_of_a_pair() {
+        let pipeline = hello_pipeline_with_truncation(truncate_to(4));
+
+        let encoding = pipeline
+            .encode(("hhhhhhello", "hhhello"), &EncodeOptions::default())
+            .wait()
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(ids(&encoding), [0, 0, 0, 0]);
+        assert_eq!(encoding.type_ids().unwrap(), [0, 0, 1, 1]);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::Both));
+    }
+
+    // `OnlyFirst`/`OnlySecond` name the side to cut: 6 + 3 = 9 tokens against a budget of 7
+    // removes 2, all from the named side.
+    #[test]
+    fn truncation_source_marks_only_the_cut_side_of_a_pair() {
+        let pipeline = hello_pipeline();
+        let options = |strategy| EncodeOptions {
+            truncation: Override::With(TruncationParams {
+                max_length: 7,
+                strategy,
+                ..TruncationParams::default()
+            }),
+            ..EncodeOptions::default()
+        };
+
+        let encoding = pipeline
+            .encode(
+                ("hhhhhhello", "hhhello"),
+                &options(TruncationStrategy::OnlyFirst),
+            )
+            .wait()
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(ids(&encoding), [0, 0, 0, 0, 0, 0, 7]);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::First));
+
+        let encoding = pipeline
+            .encode(
+                ("hhhhhhello", "hhhello"),
+                &options(TruncationStrategy::OnlySecond),
+            )
+            .wait()
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(ids(&encoding), [0, 0, 0, 0, 0, 7, 0]);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::Second));
+    }
+
+    // `lol` is carved out of the raw text as added id 8 before the model runs, so the input is
+    // the six tokens [8, 5, 8, 3, 2, 7] (`lol hel lol o l hello`); truncating to 3 proves the
+    // carved specials count toward `max_length`, and the cut is charged to the only sequence.
+    #[test]
+    fn truncation_source_counts_carved_special_tokens() {
+        let pipeline = hello_pipeline_with_special("lol");
+        let encodings = pipeline
+            .encode("lolhellololhello", &EncodeOptions::no_specials())
+            .wait()
+            .unwrap();
+        assert_eq!(ids(&encodings[0]), [8, 5, 8, 3, 2, 7]);
+        assert_eq!(encodings[0].truncation_source(), None);
+
+        let options = EncodeOptions {
+            truncation: Override::With(truncate_to(3)),
+            ..EncodeOptions::no_specials()
+        };
+
+        let encoding = pipeline
+            .encode("lolhellololhello", &options)
+            .wait()
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(ids(&encoding), [8, 5, 8]);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::First));
+    }
+
+    // Padding runs after truncation and says nothing about it: the marker survives the pad.
+    #[test]
+    fn padding_keeps_the_truncation_source() {
+        let pipeline = hello_pipeline_with(
+            PipelinePostProcessor::default(),
+            Some(pad_to(8)),
+            Some(truncate_to(2)),
+        );
+
+        let encoding = encode_six_tokens(&pipeline, &EncodeOptions::default());
+
+        assert_eq!(ids(&encoding), TRUNCATED_THEN_PADDED);
+        assert_eq!(encoding.truncation_source(), Some(TruncationSource::First));
+    }
+
+    // The failure paths are unaffected by the marker: `OnlySecond` without a pair and a sequence
+    // too short for `OnlyFirst` still come back as the same `TruncationError`s.
+    #[test]
+    fn truncation_source_failure_paths_still_error() {
+        let pipeline = hello_pipeline_with_truncation(TruncationParams {
+            max_length: 2,
+            strategy: TruncationStrategy::OnlySecond,
+            ..TruncationParams::default()
+        });
+
+        let err = pipeline
+            .encode("hhhhhhello", &EncodeOptions::default())
+            .wait()
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err.downcast_ref::<TruncationError>(),
+            Some(TruncationError::SecondSequenceNotProvided)
+        ));
+
+        let pipeline = hello_pipeline_with_truncation(TruncationParams {
+            max_length: 2,
+            strategy: TruncationStrategy::OnlyFirst,
+            ..TruncationParams::default()
+        });
+
+        let err = pipeline
+            .encode(("hello", "hhhhhhello"), &EncodeOptions::default())
+            .wait()
+            .err()
+            .unwrap();
+
+        assert!(matches!(
+            err.downcast_ref::<TruncationError>(),
+            Some(TruncationError::SequenceTooShort)
+        ));
     }
 
     // Released 0.23.1 subtracts the specials from `max_length` only when it is about to add them

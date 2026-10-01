@@ -78,6 +78,8 @@ fn pad_one(encoding: &mut Encoding, target_length: usize, params: &PaddingParams
     let pad_length = target_length - original_len;
     let pad_id = PipelineToken::from(params.pad_id);
     let pad_type_id = params.pad_type_id as u8;
+    // Padding happens after truncation and says nothing about it: the marker carries over.
+    let truncation_source = encoding.truncation_source;
 
     let mut ids = std::mem::take(&mut encoding.ids);
     let mut type_ids =
@@ -105,6 +107,7 @@ fn pad_one(encoding: &mut Encoding, target_length: usize, params: &PaddingParams
         ids,
         type_ids: Some(type_ids),
         attention_mask: Some(attention_mask),
+        truncation_source,
     };
 }
 
@@ -121,6 +124,7 @@ mod tests {
             ids: make_tokens(ids),
             type_ids: None,
             attention_mask: None,
+            truncation_source: None,
         }
     }
 
@@ -207,6 +211,7 @@ mod tests {
             ids: make_tokens(0..3),
             type_ids: Some(vec![1, 1, 1]),
             attention_mask: None,
+            truncation_source: None,
         }];
         let params = PaddingParams {
             strategy: PaddingStrategy::Fixed(5),
@@ -226,6 +231,7 @@ mod tests {
             ids: make_tokens(0..3),
             type_ids: Some(vec![1, 1, 1]),
             attention_mask: None,
+            truncation_source: None,
         }];
         let params = PaddingParams {
             strategy: PaddingStrategy::Fixed(5),
