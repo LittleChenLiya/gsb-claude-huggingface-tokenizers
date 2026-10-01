@@ -6,6 +6,7 @@
 use super::*;
 use crate::pipeline;
 use crate::tokenizer::Result;
+use crate::vocab::bucket_vocab_store::BucketVocabStore;
 
 use crate::{pipeline::Model as PipelineModel, utils::byte_level::BYTES_CHAR_LOOKUP};
 
@@ -402,4 +403,188 @@ fn byte_level_requires_full_byte_coverage() {
         })
         .is_err()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Merge-step tracing
+// ---------------------------------------------------------------------------
+
+/// Builds a model from a hand-resolved merge map, so merges can share a rank. The public
+/// [`PipelineBPE::from_config`] assigns each merge its position in the list as a rank, which can
+/// never produce a tie; this door exists to build equal-rank fixtures.
+fn model_from_merge_map(vocab: Vocab, merges: MergeMap, byte_level: bool) -> PipelineBPE {
+    let store = BucketVocabStore::build(
+        vocab
+            .into_iter()
+            .map(|(token, id)| (token.into_bytes(), id))
+            .collect(),
+    );
+    PipelineBPE::from_merge_map(
+        store,
+        merges,
+        BpeConfig {
+            byte_level,
+            ..BpeConfig::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Tiny vocab with two rank-0 merges that compete for the same middle atom:
+/// `(a,b)` and `(b,c)` are both rank 0, then `(ab,c)` is rank 1.
+fn equal_rank_model() -> PipelineBPE {
+    // external ids
+    let vocab: Vocab = [
+        ("a", 0),
+        ("b", 1),
+        ("c", 2),
+        ("ab", 3),
+        ("bc", 4),
+        ("abc", 5),
+    ]
+    .iter()
+    .map(|&(s, id)| (s.to_string(), id))
+    .collect();
+    let mut merges = MergeMap::new();
+    merges.insert((0, 1), (0, 3)); // (a,b) -> ab, rank 0
+    merges.insert((1, 2), (0, 4)); // (b,c) -> bc, rank 0 (tie with the above)
+    merges.insert((3, 2), (1, 5)); // (ab,c) -> abc, rank 1
+    model_from_merge_map(vocab, merges, false)
+}
+
+/// Vocab with two *independent* rank-0 merges `(a,b)` and `(c,d)`, plus the chain to `abcd`.
+fn two_pair_model() -> PipelineBPE {
+    let vocab: Vocab = [
+        ("a", 0),
+        ("b", 1),
+        ("c", 2),
+        ("d", 3),
+        ("ab", 4),
+        ("cd", 5),
+        ("abc", 6),
+        ("abcd", 7),
+    ]
+    .iter()
+    .map(|&(s, id)| (s.to_string(), id))
+    .collect();
+    let mut merges = MergeMap::new();
+    merges.insert((0, 1), (0, 4)); // (a,b) -> ab, rank 0
+    merges.insert((2, 3), (0, 5)); // (c,d) -> cd, rank 0 (tie)
+    merges.insert((4, 2), (1, 6)); // (ab,c) -> abc, rank 1
+    merges.insert((6, 3), (2, 7)); // (abc,d) -> abcd, rank 2
+    model_from_merge_map(vocab, merges, false)
+}
+
+/// Long runs of `a` go to the hot/cold queue (the gate is 24 bytes for ASCII). A chain of merges
+/// `(a*k, a) -> a*(k+1)` exercises the queue engine's tracing path.
+fn long_a_model() -> PipelineBPE {
+    let mut vocab: Vocab = [("a", 0)].iter().map(|&(s, id)| (s.to_string(), id)).collect();
+    for k in 2..=17u32 {
+        vocab.insert("a".repeat(k as usize), k - 1); // aa=1, aaa=2, ..., a*17=16
+    }
+    let mut merges = MergeMap::new();
+    merges.insert((0, 0), (0, 1)); // (a,a) -> aa, rank 0
+    for k in 2u32..=16 {
+        merges.insert((k - 1, 0), (k - 1, k)); // (a*k, a) -> a*(k+1), rank k-1
+    }
+    model_from_merge_map(vocab, merges, false)
+}
+
+fn traced_ids(model: &PipelineBPE, sequence: &str) -> (Vec<u32>, Vec<MergeStep>) {
+    let mut scratch = model.init_scratch();
+    let mut output = Vec::new();
+    let mut trace = Vec::new();
+    model
+        .tokenize_pipeline_traced(sequence, &mut scratch, &mut output, &mut trace)
+        .unwrap();
+    (output.iter().map(|t| t.id()).collect(), trace)
+}
+
+#[test]
+fn traced_encode_records_steps_and_final_tokens() {
+    let model = equal_rank_model();
+    // `abcc` is not a vocab entry, so it runs the merge engine. Its pairs `(a,b)` and `(b,c)` are
+    // both rank 0 and compete for `b`; the leftmost `(a,b)` wins deterministically, then `(ab,c)`
+    // merges at rank 1. `(b,c)` never merges because `b` was consumed.
+    let (ids, trace) = traced_ids(&model, "abcc");
+    assert_eq!(
+        ids,
+        vec![5, 2],
+        "final tokens for `abcc` should be [abc, c]"
+    );
+    assert_eq!(
+        trace,
+        vec![
+            MergeStep {
+                left: 0,
+                right: 1,
+                rank: 0
+            }, // (a,b)
+            MergeStep {
+                left: 3,
+                right: 2,
+                rank: 1
+            }, // (ab,c)
+        ]
+    );
+}
+
+#[test]
+fn equal_rank_pairs_merge_left_to_right() {
+    let model = two_pair_model();
+    let (ids, trace) = traced_ids(&model, "abcd");
+    assert_eq!(ids, vec![4, 5], "final tokens for `abcd` should be [ab, cd]");
+    // Both rank 0: applied in left-to-right order, (a,b) then (c,d).
+    assert_eq!(
+        trace,
+        vec![
+            MergeStep {
+                left: 0,
+                right: 1,
+                rank: 0
+            }, // (a,b)
+            MergeStep {
+                left: 2,
+                right: 3,
+                rank: 0
+            }, // (c,d)
+        ]
+    );
+}
+
+#[test]
+fn traced_output_matches_untraced() {
+    let model = equal_rank_model();
+    for word in ["abc", "ab", "bc", "a", "c", "abbc", "abcc", ""] {
+        let (traced, _trace) = traced_ids(&model, word);
+        assert_eq!(traced, pipeline_ids(&model, word), "{word:?}");
+    }
+}
+
+#[test]
+fn traced_word_without_merges_records_nothing() {
+    let model = equal_rank_model();
+    let (ids, trace) = traced_ids(&model, "a");
+    assert_eq!(ids, vec![0]);
+    assert!(trace.is_empty(), "a single atom has no pair to merge");
+}
+
+#[test]
+fn traced_long_word_matches_untraced_and_records_steps() {
+    let model = long_a_model();
+    let word = "a".repeat(30);
+    let (traced, trace) = traced_ids(&model, &word);
+    assert_eq!(
+        traced,
+        pipeline_ids(&model, &word),
+        "long word goes to the queue engine"
+    );
+    assert!(!trace.is_empty(), "a 30-a word applies merges");
+    for step in &trace {
+        assert!(
+            step.left <= 16 && step.right <= 16,
+            "step ids must be vocabulary ids: {step:?}"
+        );
+        assert!(step.rank <= 15, "rank must be in the merge range: {step:?}");
+    }
 }

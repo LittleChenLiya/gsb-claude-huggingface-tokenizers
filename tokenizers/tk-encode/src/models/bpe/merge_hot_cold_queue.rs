@@ -19,6 +19,7 @@
 //! their new keys to hot; the keys already queued for those neighbours go stale, and are recognized
 //! and skipped because their rank half no longer matches the entry's current rank. When the queue
 //! runs dry, the merged word is read back by walking the links from the leftmost live entry.
+use crate::models::bpe::merge_trace::MergeTracer;
 use crate::models::bpe::tables::{BpeTables, ID_MASK, RANK_MASK};
 
 /// Rank of an [`Entry`] that will not be merged, either because its pair has no merge at all or
@@ -33,7 +34,15 @@ const EMPTY_KEY: u64 = u64::MAX;
 
 /// Merges the word whose pair entries and queue keys `scratch` holds (filled by `convert_queue`),
 /// writing the merged word into `symbols` as internal ids.
-pub fn merge_with_queue(tables: &BpeTables, symbols: &mut Vec<u32>, scratch: &mut QueueScratch) {
+///
+/// Each applied merge is reported to `tracer` (see `merge_trace`); with the no-op tracer the calls
+/// compile away and the loop is exactly the untraced one.
+pub fn merge_with_queue<T: MergeTracer>(
+    tables: &BpeTables,
+    symbols: &mut Vec<u32>,
+    scratch: &mut QueueScratch,
+    tracer: &mut T,
+) {
     let QueueScratch { entries, queue } = scratch;
     if entries.is_empty() {
         return;
@@ -53,6 +62,9 @@ pub fn merge_with_queue(tables: &BpeTables, symbols: &mut Vec<u32>, scratch: &mu
         if entry.rank as u64 != key >> 32 {
             continue;
         }
+        // Report before the entry is marked dead: `entry.left_symbol`/`entry.right_symbol` are the
+        // two tokens this merge joins, and `entry.rank` its rank.
+        tracer.record(tables, entry.left_symbol, entry.right_symbol, entry.rank);
         entries[index].rank = DEAD_RANK;
         if entry.left_pair_index == NONE {
             leftmost = entry.right_pair_index;

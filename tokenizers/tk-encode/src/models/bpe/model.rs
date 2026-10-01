@@ -6,6 +6,7 @@ use crate::models::bpe::At;
 use crate::models::bpe::convert::Affixes;
 use crate::models::bpe::merge_hot_cold_queue::{QueueScratch, merge_with_queue};
 use crate::models::bpe::merge_multipass::merge_multipass;
+use crate::models::bpe::merge_trace::{MergeStep, MergeTracer, NoTrace, TraceBuffer};
 use crate::models::bpe::tables::BpeTables;
 use crate::pipeline::{self, PipelineToken, Span};
 use crate::tokenizer::Result;
@@ -125,7 +126,7 @@ impl PipelineBPE {
                 // A single atom has no pair to merge and is trivially its own encoding.
                 true
             } else {
-                self.merge_word(text, &mut symbols, &mut scratch);
+                self.merge_word(text, &mut symbols, &mut scratch, &mut NoTrace);
                 symbols.len() == 1 && self.tables.unmap.at(symbols[0] as usize) == id
             };
             proven[id as usize] = foldable;
@@ -147,11 +148,16 @@ impl PipelineBPE {
     /// `symbols` is the caller's reusable symbol buffer -- it lives in the scratch so that a word
     /// costs no allocation. On return it holds the merged word as internal ids, which the caller
     /// maps to external ids through `unmap`.
-    pub(super) fn merge_word(
+    ///
+    /// Every applied merge is reported to `tracer` (see `merge_trace`). The hot path passes
+    /// [`NoTrace`], whose report is a no-op that inlines away; an opt-in encode passes a
+    /// [`TraceBuffer`] to collect the steps.
+    pub(super) fn merge_word<T: MergeTracer>(
         &self,
         sequence: &str,
         symbols: &mut Vec<u32>,
         queue_scratch: &mut QueueScratch,
+        tracer: &mut T,
     ) {
         let bytes = sequence.as_bytes();
         // Classify on the first content byte, not on the delimiter the pre-tokenizer prepended.
@@ -160,36 +166,23 @@ impl PipelineBPE {
         if sequence.len() > gate as usize {
             // conversion writes the entries and cold keys directly: no intermediate symbol array
             self.convert_queue(sequence, symbols, queue_scratch);
-            merge_with_queue(&self.tables, symbols, queue_scratch);
+            merge_with_queue(&self.tables, symbols, queue_scratch, tracer);
         } else {
             let first_merge = self.convert_multipass(sequence, symbols);
-            merge_multipass(&self.tables, symbols, first_merge);
+            merge_multipass(&self.tables, symbols, first_merge, tracer);
         }
     }
-}
 
-/// Per-thread scratch for BPE. Every buffer here is cleared, never reallocated, so tokenizing a
-/// sequence does not allocate.
-pub struct BpeScratch {
-    /// Symbols of the word being merged.
-    pub(crate) symbols: Vec<u32>,
-    /// Entry arena and the two queue tiers.
-    pub(crate) queue: QueueScratch,
-    /// Words already seen, so a repeat costs a probe instead of a merge. It lives in the scratch
-    /// so it outlives the encode call that fills it -- otherwise it would never see a word twice.
-    pub(crate) word_cache: Option<WordCache>,
-}
-
-impl pipeline::ModelScratch for BpeScratch {}
-
-impl pipeline::Model for PipelineBPE {
-    type Scratch = BpeScratch;
-
-    fn tokenize_pipeline(
+    /// The body of [`Self::tokenize_pipeline`], generic over the merge tracer. The trait method
+    /// instantiates it with [`NoTrace`] (tracing off: the report compiles away, so this is the
+    /// exact same path as before); [`Self::tokenize_pipeline_traced`] instantiates it with a
+    /// [`TraceBuffer`] to collect the steps.
+    fn tokenize_pipeline_inner<T: MergeTracer>(
         &self,
         sequence: &str,
-        scratch: &mut Self::Scratch,
+        scratch: &mut BpeScratch,
         output: &mut Vec<PipelineToken>,
+        tracer: &mut T,
     ) -> Result<()> {
         if sequence.is_empty() {
             return Ok(());
@@ -229,7 +222,7 @@ impl pipeline::Model for PipelineBPE {
         }
 
         let start = output.len();
-        self.merge_word(sequence, symbols, queue);
+        self.merge_word(sequence, symbols, queue, tracer);
         // the merge engines work in internal ids; `unmap` takes them back to the vocab's own ids
         output.extend(
             symbols
@@ -243,6 +236,49 @@ impl pipeline::Model for PipelineBPE {
         }
 
         Ok(())
+    }
+
+    /// Encodes `sequence` exactly like [`Self::tokenize_pipeline`], additionally recording every
+    /// merge step BPE applies into `trace`, in application order.
+    ///
+    /// A cache hit or a fold applies no merges and records nothing; only a word run through the
+    /// merge engine contributes steps. The final tokens written to `output` are identical to a
+    /// non-traced encode of the same input.
+    pub fn tokenize_pipeline_traced(
+        &self,
+        sequence: &str,
+        scratch: &mut BpeScratch,
+        output: &mut Vec<PipelineToken>,
+        trace: &mut Vec<MergeStep>,
+    ) -> Result<()> {
+        self.tokenize_pipeline_inner(sequence, scratch, output, &mut TraceBuffer { steps: trace })
+    }
+}
+
+/// Per-thread scratch for BPE. Every buffer here is cleared, never reallocated, so tokenizing a
+/// sequence does not allocate.
+pub struct BpeScratch {
+    /// Symbols of the word being merged.
+    pub(crate) symbols: Vec<u32>,
+    /// Entry arena and the two queue tiers.
+    pub(crate) queue: QueueScratch,
+    /// Words already seen, so a repeat costs a probe instead of a merge. It lives in the scratch
+    /// so it outlives the encode call that fills it -- otherwise it would never see a word twice.
+    pub(crate) word_cache: Option<WordCache>,
+}
+
+impl pipeline::ModelScratch for BpeScratch {}
+
+impl pipeline::Model for PipelineBPE {
+    type Scratch = BpeScratch;
+
+    fn tokenize_pipeline(
+        &self,
+        sequence: &str,
+        scratch: &mut Self::Scratch,
+        output: &mut Vec<PipelineToken>,
+    ) -> Result<()> {
+        self.tokenize_pipeline_inner(sequence, scratch, output, &mut NoTrace)
     }
 
     /// Every pre-token of a chunk in one call.
@@ -360,7 +396,7 @@ impl pipeline::Model for PipelineBPE {
             // SAFETY: `cursor` counts what the fast paths wrote; the merge below uses `output`
             unsafe { output.set_len(cursor) };
             let start = output.len();
-            self.merge_word(sequence, symbols, queue);
+            self.merge_word(sequence, symbols, queue, &mut NoTrace);
             // the merge engines work in internal ids; `unmap` takes them back to the vocab's own ids
             output.extend(
                 symbols

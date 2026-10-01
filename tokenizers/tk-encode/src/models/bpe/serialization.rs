@@ -197,7 +197,7 @@ impl PipelineBPE {
 
     /// The same construction, entered from a vocabulary store and a merge map that have *already*
     /// been resolved against each other.
-    fn from_merge_map(
+    pub(crate) fn from_merge_map(
         vocab: BucketVocabStore,
         merges: MergeMap,
         config: BpeConfig,

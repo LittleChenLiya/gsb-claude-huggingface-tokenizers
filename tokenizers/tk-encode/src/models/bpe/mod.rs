@@ -5,6 +5,7 @@ mod convert;
 mod fold;
 mod merge_hot_cold_queue;
 mod merge_multipass;
+mod merge_trace;
 mod model;
 mod pair_map;
 mod serialization;
@@ -81,5 +82,6 @@ impl<T: Copy> At for [T] {
 }
 
 // Re-export
+pub use merge_trace::MergeStep;
 pub use model::*;
 pub use serialization::BpeConfig;
