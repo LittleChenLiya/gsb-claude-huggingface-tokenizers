@@ -1,4 +1,6 @@
 #[cfg(feature = "normalizers")]
+pub mod alignment;
+#[cfg(feature = "normalizers")]
 pub mod bert;
 pub mod byte_level;
 pub mod metaspace;
