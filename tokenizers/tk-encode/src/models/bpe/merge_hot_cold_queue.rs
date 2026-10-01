@@ -19,6 +19,7 @@
 //! their new keys to hot; the keys already queued for those neighbours go stale, and are recognized
 //! and skipped because their rank half no longer matches the entry's current rank. When the queue
 //! runs dry, the merged word is read back by walking the links from the leftmost live entry.
+use crate::models::bpe::model::MergeTrace;
 use crate::models::bpe::tables::{BpeTables, ID_MASK, RANK_MASK};
 
 /// Rank of an [`Entry`] that will not be merged, either because its pair has no merge at all or
@@ -33,7 +34,14 @@ const EMPTY_KEY: u64 = u64::MAX;
 
 /// Merges the word whose pair entries and queue keys `scratch` holds (filled by `convert_queue`),
 /// writing the merged word into `symbols` as internal ids.
-pub fn merge_with_queue(tables: &BpeTables, symbols: &mut Vec<u32>, scratch: &mut QueueScratch) {
+///
+/// See [`merge_multipass`](crate::models::bpe::merge_multipass::merge_multipass) for `trace`.
+pub fn merge_with_queue<T: MergeTrace>(
+    tables: &BpeTables,
+    symbols: &mut Vec<u32>,
+    scratch: &mut QueueScratch,
+    trace: &mut T,
+) {
     let QueueScratch { entries, queue } = scratch;
     if entries.is_empty() {
         return;
@@ -54,6 +62,15 @@ pub fn merge_with_queue(tables: &BpeTables, symbols: &mut Vec<u32>, scratch: &mu
             continue;
         }
         entries[index].rank = DEAD_RANK;
+        // The key packs rank in its high half; `entry` still carries the current symbols and the
+        // pair's product. Entries pop in rank order and, on rank ties, left-to-right by index, so
+        // records land in the order BPE prescribes.
+        trace.record(
+            key & RANK_MASK,
+            entry.left_symbol,
+            entry.right_symbol,
+            entry.merged_symbol,
+        );
         if entry.left_pair_index == NONE {
             leftmost = entry.right_pair_index;
             collapsed_symbol = entry.merged_symbol;

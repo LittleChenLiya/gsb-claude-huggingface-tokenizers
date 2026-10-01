@@ -49,6 +49,81 @@ fn content_start(bytes: &[u8]) -> usize {
 const _: () = assert!(size_of::<PipelineToken>() == size_of::<u32>());
 const _: () = assert!(align_of::<PipelineToken>() == align_of::<u32>());
 
+/// One BPE merge as it happened while a word was encoded: the adjacent tokens the merge consumed,
+/// the rank that selected it, and the token the two merged into.
+///
+/// Ids are the model's *external* vocabulary ids -- the same ids encoding emits -- so a step can
+/// be read back against the vocabulary without knowing the engine's internal id remap.
+///
+/// Steps are recorded in the order the merges were applied: strictly by ascending rank, and for
+/// pairs sharing a rank, leftmost pair first. That tie rule is the one BPE prescribes and the one
+/// both merge engines follow, so a rank shared by several pairs gives a deterministic trace (and
+/// deterministic tokens) regardless of word length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeStep {
+    /// Merge rank, as declared by the merge list (0 is the highest-priority merge).
+    pub rank: u32,
+    /// External id of the merge's left adjacent token.
+    pub left_id: u32,
+    /// External id of the merge's right adjacent token.
+    pub right_id: u32,
+    /// External id of the token `(left_id, right_id)` merged into.
+    pub merged_id: u32,
+}
+
+/// What a merge engine reports at every merge. The two implementors make collection opt-in:
+/// [`NoTrace`] records nothing and monomorphises to the untraced hot path, [`MergeRecorder`]
+/// collects the steps. The engines take this by generics rather than an `Option`/trait object so
+/// that tracing off compiles to identical code to before tracing existed.
+pub(crate) trait MergeTrace {
+    /// `value` is the packed table value of the merge that fired: its high half is the rank, its
+    /// low 30 bits the *internal* id of the product. `left`/`right` are internal ids too.
+    fn record(&mut self, value: u64, left: u32, right: u32, merged_internal: u32);
+}
+
+/// The default: merge tracking off. Every call is a no-op and inlines away entirely, so the
+/// untraced path keeps its original code and performance.
+pub(crate) struct NoTrace;
+
+impl MergeTrace for NoTrace {
+    #[inline(always)]
+    fn record(&mut self, _value: u64, _left: u32, _right: u32, _merged_internal: u32) {}
+}
+
+/// Merge tracking on: holds one raw (internal-id) record per merge, in application order. The
+/// model maps them to external [`MergeStep`]s at the end, after the word is done merging.
+#[derive(Default)]
+pub(crate) struct MergeRecorder {
+    /// Each record is `(packed value, left internal, right internal, product internal)`.
+    records: Vec<(u64, u32, u32, u32)>,
+}
+
+impl MergeRecorder {
+    fn clear(&mut self) {
+        self.records.clear();
+    }
+
+    /// Maps the internal-id records to external vocabulary ids.
+    fn finish(&self, tables: &BpeTables) -> Vec<MergeStep> {
+        self.records
+            .iter()
+            .map(|&(value, left, right, merged)| MergeStep {
+                rank: (value >> 32) as u32,
+                left_id: tables.unmap.at(left as usize),
+                right_id: tables.unmap.at(right as usize),
+                merged_id: tables.unmap.at(merged as usize),
+            })
+            .collect()
+    }
+}
+
+impl MergeTrace for MergeRecorder {
+    #[inline(always)]
+    fn record(&mut self, value: u64, left: u32, right: u32, merged_internal: u32) {
+        self.records.push((value, left, right, merged_internal));
+    }
+}
+
 pub struct PipelineBPE {
     pub(super) atoms: Atoms,
     pub(super) tables: BpeTables,
@@ -153,6 +228,30 @@ impl PipelineBPE {
         symbols: &mut Vec<u32>,
         queue_scratch: &mut QueueScratch,
     ) {
+        // The no-op tracer monomorphises away: this is the same code and speed as an untraced
+        // merge, which is what the encode fast paths rely on.
+        self.merge_word_impl(sequence, symbols, queue_scratch, &mut NoTrace);
+    }
+
+    /// The same merge, with every applied merge reported to `recorder` (cleared first).
+    pub(super) fn merge_word_traced(
+        &self,
+        sequence: &str,
+        symbols: &mut Vec<u32>,
+        queue_scratch: &mut QueueScratch,
+        recorder: &mut MergeRecorder,
+    ) {
+        recorder.clear();
+        self.merge_word_impl(sequence, symbols, queue_scratch, recorder);
+    }
+
+    fn merge_word_impl<T: MergeTrace>(
+        &self,
+        sequence: &str,
+        symbols: &mut Vec<u32>,
+        queue_scratch: &mut QueueScratch,
+        trace: &mut T,
+    ) {
         let bytes = sequence.as_bytes();
         // Classify on the first content byte, not on the delimiter the pre-tokenizer prepended.
         let gate: u16 = self.byte_to_gate[bytes[content_start(bytes)] as usize];
@@ -160,11 +259,36 @@ impl PipelineBPE {
         if sequence.len() > gate as usize {
             // conversion writes the entries and cold keys directly: no intermediate symbol array
             self.convert_queue(sequence, symbols, queue_scratch);
-            merge_with_queue(&self.tables, symbols, queue_scratch);
+            merge_with_queue(&self.tables, symbols, queue_scratch, trace);
         } else {
             let first_merge = self.convert_multipass(sequence, symbols);
-            merge_multipass(&self.tables, symbols, first_merge);
+            merge_multipass(&self.tables, symbols, first_merge, trace);
         }
+    }
+
+    /// Encodes one pre-tokenized word, additionally reporting the BPE merges applied, in order.
+    ///
+    /// Returns the word's final external token ids and one [`MergeStep`] per merge. This is the
+    /// opt-in tracked counterpart of going through [`pipeline::Model::tokenize_pipeline`]: it
+    /// deliberately skips the word cache and the whole-word fold, because both answer a word
+    /// without running the merge loop and so have no merge steps to report. Running it never
+    /// mutates the state the regular encode paths use either.
+    ///
+    /// `sequence` must be a single pre-token: BPE never merges across pre-tokenizer boundaries, so
+    /// merges are only ever intra-word.
+    pub fn tokenize_with_merge_trace(&self, sequence: &str) -> (Vec<u32>, Vec<MergeStep>) {
+        let mut symbols = Vec::with_capacity(sequence.len().max(1));
+        let mut queue_scratch = QueueScratch::default();
+        let mut recorder = MergeRecorder::default();
+        if sequence.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        self.merge_word_traced(sequence, &mut symbols, &mut queue_scratch, &mut recorder);
+        let ids = symbols
+            .iter()
+            .map(|&symbol| self.tables.unmap.at(symbol as usize))
+            .collect();
+        (ids, recorder.finish(&self.tables))
     }
 }
 

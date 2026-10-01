@@ -103,13 +103,22 @@
 //! The merge is safe to batch merge only if the produced id (merged symbol) does not take part in other merges with lower rank (higher priority).
 //! This is enforced when building the lookup table and encoded in the `SAFE` bit.
 //!
-use crate::models::bpe::tables::{BpeTables, ID_MASK, SAFE_MASK};
-use std::cmp;
+use crate::models::bpe::model::MergeTrace;
+use crate::models::bpe::tables::{BpeTables, ID_MASK, RANK_MASK, SAFE_MASK};
 
 const NOT_LEGAL: u64 = u64::MAX;
 
-/// Iteratively merges a word in place until it has no legal merge left
-pub(super) fn merge_multipass(tables: &BpeTables, symbols: &mut Vec<u32>, mut target_merge: u64) {
+/// Iteratively merges a word in place until it has no legal merge left.
+///
+/// `trace` is either the no-op [`NoTrace`](crate::models::bpe::model::NoTrace) on the encode hot
+/// path, or a recorder that collects one [`MergeStep`](crate::models::bpe::MergeStep) per merge in
+/// merge order. Both compile down to the same machine code apart from the stores the recorder adds.
+pub(super) fn merge_multipass<T: MergeTrace>(
+    tables: &BpeTables,
+    symbols: &mut Vec<u32>,
+    mut target_merge: u64,
+    trace: &mut T,
+) {
     let mut len = symbols.len();
     if len < 2 || target_merge == NOT_LEGAL {
         return;
@@ -124,6 +133,7 @@ pub(super) fn merge_multipass(tables: &BpeTables, symbols: &mut Vec<u32>, mut ta
             len,
             target_merge,
             batch_merging_is_safe(tables, target_merge),
+            trace,
         );
         len = merged_length;
         if next_merge == NOT_LEGAL {
@@ -179,11 +189,12 @@ impl MergeState {
     /// instead: it writes a product id that no pair has been looked up against yet, so the
     /// next write has to pay for its own lookup.
     #[inline(always)]
-    fn step(
+    fn step<T: MergeTrace>(
         &mut self,
         tables: &BpeTables,
         symbols: &mut [u32],
         cached_pair_value: Option<u64>,
+        trace: &mut T,
     ) -> Option<u64> {
         let (left_symbol, right_symbol) =
             (symbols[self.read_cursor], symbols[self.read_cursor + 1]);
@@ -193,6 +204,10 @@ impl MergeState {
             self.was_merged = true;
             self.read_cursor += 2;
             let merged_symbol = (pair_value & ID_MASK) as u32;
+            // The sweep walks the word left to right, so when one pass applies an equal-ranked
+            // merge to several disjoint pairs, they are recorded in the same order the queue
+            // engine pops them -- the order BPE prescribes on rank ties.
+            trace.record(pair_value, left_symbol, right_symbol, merged_symbol);
             self.write(tables, symbols, merged_symbol, None);
             None
         } else {
@@ -206,6 +221,12 @@ impl MergeState {
     /// written symbol as a candidate for the next pass's target: `next_merge` keeps the lowest
     /// value seen. `Some` reuses the value the caller already looked up, `None` pays for a
     /// lookup here. The first written symbol has no left neighbour and nothing to rank.
+    ///
+    /// Two pairs can legally share a rank (a merge map built by hand can assign the same rank to
+    /// several pairs), and ties must resolve to the *leftmost* pair -- the rule the queue engine
+    /// follows by keying entries by arena index. Comparing the rank halves only, with a strict
+    /// "strictly smaller" test, makes the first (leftmost) pair seen win a tie instead of the pair
+    /// whose packed value happens to compare smaller.
     #[inline(always)]
     fn write(
         &mut self,
@@ -218,7 +239,9 @@ impl MergeState {
         if self.write_cursor > 0 {
             let rank = cached_pair_value
                 .unwrap_or_else(|| tables.get_value(&symbols[self.write_cursor - 1], &symbol));
-            self.next_merge = cmp::min(self.next_merge, rank);
+            if (rank & RANK_MASK) < (self.next_merge & RANK_MASK) {
+                self.next_merge = rank;
+            }
         }
         self.write_cursor += 1;
     }
@@ -233,12 +256,13 @@ struct MergeOnceOutput {
 ///
 /// Returns the next pass's target (`u64::MAX` when no pair in the rewritten word merges), and the number of symbols written.
 /// Symbols past `len` are leftovers of earlier passes and should be truncated.
-fn merge_once(
+fn merge_once<T: MergeTrace>(
     tables: &BpeTables,
     symbols: &mut [u32],
     len: usize,
     target_merge: u64,
     batched: bool,
+    trace: &mut T,
 ) -> MergeOnceOutput {
     // Resliced so the loop bound and the slice length are the same value. Without this the
     // compiler cannot connect `len` to the length of `symbols` and keeps a bounds check on
@@ -247,7 +271,7 @@ fn merge_once(
     let mut state = MergeState::new(target_merge, batched);
     let mut cached_pair_value = None;
     while state.read_cursor + 1 < len {
-        cached_pair_value = state.step(tables, symbols, cached_pair_value);
+        cached_pair_value = state.step(tables, symbols, cached_pair_value, trace);
     }
     if state.read_cursor < len {
         // The sweep's final symbol has no right neighbour to pair with, so it is copied as is.

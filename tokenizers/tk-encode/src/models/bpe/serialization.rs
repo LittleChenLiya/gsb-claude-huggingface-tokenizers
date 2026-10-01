@@ -197,7 +197,11 @@ impl PipelineBPE {
 
     /// The same construction, entered from a vocabulary store and a merge map that have *already*
     /// been resolved against each other.
-    fn from_merge_map(
+    ///
+    /// `pub(super)` rather than private so the crate's tests can hand-craft a merge map -- in
+    /// particular one in which several pairs share a rank, which the rank-enumerating
+    /// [`PipelineBPE::from_config`] cannot produce.
+    pub(super) fn from_merge_map(
         vocab: BucketVocabStore,
         merges: MergeMap,
         config: BpeConfig,
