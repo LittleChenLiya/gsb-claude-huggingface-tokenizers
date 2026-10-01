@@ -11,7 +11,7 @@ use crate::models::wordlevel::WordLevel;
 use crate::models::wordpiece::{PipelineWordPiece, WordPieceScratch};
 pub use crate::pipeline::encode_options::EncodeOptions;
 pub use crate::pipeline::encode_options::Override;
-use crate::utils::truncation::truncate_pair;
+use crate::utils::truncation::{TruncationSource, truncate_pair};
 use crate::{
     DecoderRuntime, PaddingParams, TruncationParams,
     models::bpe::{BpeScratch, PipelineBPE},
@@ -478,6 +478,8 @@ pub struct Encoding {
     pub(crate) type_ids: Option<Vec<u8>>,
     /// `None` if the encoding is not padded (mask is all ones)
     pub(crate) attention_mask: Option<Vec<u8>>,
+    /// Which input segment(s) truncation cut into; [`TruncationSource::None`] when nothing was cut.
+    pub(crate) truncation_source: TruncationSource,
 }
 
 impl Encoding {
@@ -486,6 +488,7 @@ impl Encoding {
             ids: Vec::new(),
             type_ids: None,
             attention_mask: None,
+            truncation_source: TruncationSource::None,
         }
     }
 
@@ -495,7 +498,13 @@ impl Encoding {
             ids,
             type_ids,
             attention_mask: None,
+            truncation_source: TruncationSource::None,
         }
+    }
+
+    /// Stamp the encoding with the segment that truncation cut into.
+    pub(crate) fn set_truncation_source(&mut self, source: TruncationSource) {
+        self.truncation_source = source;
     }
 }
 
@@ -518,6 +527,13 @@ impl Encoding {
 
     pub fn attention_mask(&self) -> Option<&[u8]> {
         self.attention_mask.as_deref()
+    }
+
+    /// Which input segment(s) made the sequence exceed `max_length`.
+    ///
+    /// [`TruncationSource::None`] when no truncation happened, or when the input already fit.
+    pub fn truncation_source(&self) -> TruncationSource {
+        self.truncation_source
     }
 }
 /// Iterator yields results in completion order
@@ -692,12 +708,14 @@ impl PipelineTokenizer {
             0
         };
         let truncation = self.resolve_truncation(&options.truncation);
-        let (s1, s2) = truncate_pair(s1, s2, truncation, num_added_specials)?;
-        Ok(if options.add_special_tokens {
+        let (s1, s2, source) = truncate_pair(s1, s2, truncation, num_added_specials)?;
+        let mut encoding = if options.add_special_tokens {
             template.post_process::<true>(s1, s2)
         } else {
             template.post_process::<false>(s1, s2)
-        })
+        };
+        encoding.set_truncation_source(source);
+        Ok(encoding)
     }
 
     /// Encode one sequence, appending its ids to `output`.
@@ -1661,6 +1679,167 @@ mod tests {
             .unwrap();
 
         assert_eq!(encoding.ids().as_ptr(), address);
+    }
+
+    // The truncation source reaches the encoding result, including through the post-processor that
+    // adds specials. Token counts include the specials the template adds.
+    #[test]
+    fn test_truncation_source_single_with_specials() {
+        // `[CLS] $A [SEP]` adds 2 specials; 8 sequence tokens with max 5 => 3 kept, source First.
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(5, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(tokens(1..=8), None, &EncodeOptions::default())
+            .unwrap();
+
+        assert_eq!(ids(&encoding), [CLS, 1, 2, 3, SEP]);
+        assert_eq!(encoding.len(), 5);
+        assert_eq!(encoding.truncation_source(), TruncationSource::First);
+    }
+
+    // No specials added: the full `max_length` is sequence tokens, so 8 tokens with max 5 are cut
+    // to 5 and the marker still names the first segment.
+    #[test]
+    fn test_truncation_source_single_no_specials() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(5, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(tokens(1..=8), None, &EncodeOptions::no_specials())
+            .unwrap();
+
+        assert_eq!(ids(&encoding), [1, 2, 3, 4, 5]);
+        assert_eq!(encoding.len(), 5);
+        assert_eq!(encoding.truncation_source(), TruncationSource::First);
+    }
+
+    // A pair where only the long first sequence is cut, through the BERT pair template.
+    #[test]
+    fn test_truncation_source_pair_first() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(8, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(
+                tokens(1..=8),
+                Some(tokens(11..=12)),
+                &EncodeOptions::default(),
+            )
+            .unwrap();
+
+        // 8 + 2 = 10 sequence tokens, 3 specials, max 8 => 5 kept: A cut to 3, B untouched (2).
+        assert_eq!(ids(&encoding), [CLS, 1, 2, 3, SEP, 11, 12, SEP]);
+        assert_eq!(encoding.len(), 8);
+        assert_eq!(encoding.truncation_source(), TruncationSource::First);
+    }
+
+    // A pair where only the long second sequence is cut.
+    #[test]
+    fn test_truncation_source_pair_second() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(8, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(
+                tokens(1..=2),
+                Some(tokens(11..=18)),
+                &EncodeOptions::default(),
+            )
+            .unwrap();
+
+        // 2 + 8 = 10 sequence tokens, 3 specials, max 8 => 5 kept: A untouched (2), B cut to 3.
+        assert_eq!(ids(&encoding), [CLS, 1, 2, SEP, 11, 12, 13, SEP]);
+        assert_eq!(encoding.len(), 8);
+        assert_eq!(encoding.truncation_source(), TruncationSource::Second);
+    }
+
+    // A pair where both sequences are cut.
+    #[test]
+    fn test_truncation_source_pair_both() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(7, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(
+                tokens(1..=8),
+                Some(tokens(11..=18)),
+                &EncodeOptions::default(),
+            )
+            .unwrap();
+
+        // 8 + 8 = 16 sequence tokens, 3 specials, max 7 => 4 kept: 2 from A, 2 from B.
+        assert_eq!(ids(&encoding), [CLS, 1, 2, SEP, 11, 12, SEP]);
+        assert_eq!(encoding.len(), 7);
+        assert_eq!(encoding.truncation_source(), TruncationSource::Both);
+    }
+
+    // A pair that already fits: no cut, marker is None, and the token count is the full input plus
+    // the template's specials.
+    #[test]
+    fn test_truncation_source_pair_fits() {
+        let pipeline = pipeline_with(
+            bert_post_processor(),
+            truncation(20, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .post_process(
+                tokens(1..=2),
+                Some(tokens(11..=12)),
+                &EncodeOptions::default(),
+            )
+            .unwrap();
+
+        assert_eq!(ids(&encoding), [CLS, 1, 2, SEP, 11, 12, SEP]);
+        assert_eq!(encoding.len(), 7);
+        assert_eq!(encoding.truncation_source(), TruncationSource::None);
+    }
+
+    // No truncation configured: the marker is None and the result is byte-for-byte what the
+    // template produced.
+    #[test]
+    fn test_truncation_source_none_config() {
+        let pipeline = pipeline_with(bert_post_processor(), None);
+
+        let encoding = pipeline
+            .post_process(tokens(1..=8), None, &EncodeOptions::default())
+            .unwrap();
+
+        assert_eq!(ids(&encoding), [CLS, 1, 2, 3, 4, 5, 6, 7, 8, SEP]);
+        assert_eq!(encoding.len(), 10);
+        assert_eq!(encoding.truncation_source(), TruncationSource::None);
+    }
+
+    // Padding runs after truncation: the marker survives padding unchanged.
+    #[test]
+    fn test_truncation_source_survives_padding() {
+        let pipeline = hello_pipeline_with(
+            bert_post_processor(),
+            Some(pad_to(10)),
+            truncation(5, TruncationStrategy::LongestFirst),
+        );
+
+        let encoding = pipeline
+            .encode(SIX_TOKENS, &EncodeOptions::default())
+            .wait()
+            .unwrap()
+            .remove(0);
+
+        // "hhhhhhello" is 6 tokens; max 5 with 2 specials keeps 3, then padding extends to 10.
+        assert_eq!(ids(&encoding), [CLS, 0, 0, 0, SEP, PAD, PAD, PAD, PAD, PAD]);
+        assert_eq!(encoding.len(), 10);
+        assert_eq!(encoding.truncation_source(), TruncationSource::First);
     }
 
     // `encode_into` has a shortcut of its own for a template that adds nothing, and it skips

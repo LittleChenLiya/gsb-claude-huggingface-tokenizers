@@ -56,6 +56,57 @@ pub enum TruncationStrategy {
     OnlySecond,
 }
 
+/// Marks which input segment(s) a truncation cut into.
+///
+/// Attached to an [`Encoding`] after truncation so a caller can tell which part of the input
+/// made the sequence exceed `max_length`. A segment counts as truncated only when tokens were
+/// actually removed from it, so a pair where only `$A` is cut reports [`First`] even under the
+/// `longest_first` strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TruncationSource {
+    /// Nothing was truncated: no truncation was configured, or the input already fit.
+    #[default]
+    None,
+    /// The first sequence (the lone sequence of a single input, or `$A` of a pair) was cut.
+    First,
+    /// The second sequence (`$B` of a pair) was cut.
+    Second,
+    /// Both sequences were cut.
+    Both,
+}
+
+impl std::convert::AsRef<str> for TruncationSource {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::None => "none",
+            Self::First => "first",
+            Self::Second => "second",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// Compute the [`TruncationSource`] from the lengths before and after truncation.
+///
+/// A segment is "cut" only when it actually lost tokens, which keeps the marker honest for
+/// `longest_first` (it leaves the short sequence alone) and for `max_length == 0` (a sequence
+/// that was already empty does not count as truncated).
+fn truncation_source(
+    s1_before: usize,
+    s2_before: Option<usize>,
+    s1_after: usize,
+    s2_after: Option<usize>,
+) -> TruncationSource {
+    let first_cut = s1_after < s1_before;
+    let second_cut = s2_after.is_some_and(|after| s2_before.is_some_and(|before| after < before));
+    match (first_cut, second_cut) {
+        (true, true) => TruncationSource::Both,
+        (true, false) => TruncationSource::First,
+        (false, true) => TruncationSource::Second,
+        (false, false) => TruncationSource::None,
+    }
+}
+
 impl std::convert::AsRef<str> for TruncationStrategy {
     fn as_ref(&self) -> &str {
         match self {
@@ -71,8 +122,11 @@ pub fn truncate_pair(
     maybe_s2: Option<Vec<PipelineToken>>,
     truncation: Option<&TruncationParams>,
     num_added_special_tokens: usize,
-) -> Result<(Vec<PipelineToken>, Option<Vec<PipelineToken>>)> {
+) -> Result<(Vec<PipelineToken>, Option<Vec<PipelineToken>>, TruncationSource)> {
     let seq_len = s1.len() + maybe_s2.as_ref().map_or(0, Vec::len);
+    // Lengths before truncation, so the returned marker can say which segment lost tokens.
+    let s1_len = s1.len();
+    let s2_len = maybe_s2.as_ref().map(Vec::len);
 
     if let Some(truncation) = truncation {
         let truncate_to_length = truncation
@@ -85,7 +139,9 @@ pub fn truncate_pair(
                 "Truncation max_length is too short to include the tokens: `max_length` is {}, the post-processor adds {num_added_special_tokens} special tokens. Returning an empty sequence",
                 truncation.max_length
             );
-            Ok((Vec::new(), maybe_s2.and(Some(Vec::new()))))
+            let s2 = maybe_s2.and(Some(Vec::new()));
+            let source = truncation_source(s1_len, s2_len, 0, s2.as_ref().map(Vec::len));
+            Ok((Vec::new(), s2, source))
         } else if seq_len > truncate_to_length {
             let num_removed = seq_len - truncate_to_length;
 
@@ -124,11 +180,19 @@ pub fn truncate_pair(
                         }
                         truncate_tokens(&mut s1, n1, truncation.direction);
                         truncate_tokens(&mut s2, n2, truncation.direction);
-                        Ok((s1, Some(s2)))
+                        let source = truncation_source(
+                            s1_len,
+                            s2_len,
+                            s1.len(),
+                            Some(s2.len()),
+                        );
+                        Ok((s1, Some(s2), source))
                     } else {
                         let len = s1.len();
                         truncate_tokens(&mut s1, len - num_removed, truncation.direction);
-                        Ok((s1, maybe_s2))
+                        let source =
+                            truncation_source(s1_len, s2_len, s1.len(), maybe_s2.as_ref().map(Vec::len));
+                        Ok((s1, maybe_s2, source))
                     }
                 }
                 TruncationStrategy::OnlyFirst | TruncationStrategy::OnlySecond => {
@@ -150,20 +214,23 @@ pub fn truncate_pair(
                     } else {
                         return Err(Box::new(TruncationError::SequenceTooShort));
                     }
-                    if truncation.strategy == TruncationStrategy::OnlyFirst {
-                        Ok((sequence_to_truncate, other))
+                    let (s1, s2) = if truncation.strategy == TruncationStrategy::OnlyFirst {
+                        (sequence_to_truncate, other)
                     } else {
-                        Ok((other.unwrap(), Some(sequence_to_truncate)))
-                    }
+                        (other.unwrap(), Some(sequence_to_truncate))
+                    };
+                    let source =
+                        truncation_source(s1_len, s2_len, s1.len(), s2.as_ref().map(Vec::len));
+                    Ok((s1, s2, source))
                 }
             }
         } else {
             // No need to truncate
-            Ok((s1, maybe_s2))
+            Ok((s1, maybe_s2, TruncationSource::None))
         }
     } else {
         // None config = no truncation
-        Ok((s1, maybe_s2))
+        Ok((s1, maybe_s2, TruncationSource::None))
     }
 }
 
@@ -215,7 +282,7 @@ mod tests {
         n1: usize,
         n2: usize,
     ) {
-        let (t1, t2) = truncate_pair(s1, Some(s2), truncation.as_ref(), 0).unwrap();
+        let (t1, t2, _source) = truncate_pair(s1, Some(s2), truncation.as_ref(), 0).unwrap();
         assert_eq!(t1.len(), n1);
         assert_eq!(t2.expect("the pair is kept").len(), n2);
     }
@@ -252,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_longest_first_single() {
-        let (t1, t2) = truncate_pair(
+        let (t1, t2, _source) = truncate_pair(
             long(),
             None,
             params(3, TruncationStrategy::LongestFirst).as_ref(),
@@ -270,16 +337,16 @@ mod tests {
     fn test_specials() {
         let params = params(8, TruncationStrategy::LongestFirst);
 
-        let (untouched, _) = truncate_pair(long(), None, params.as_ref(), 0).unwrap();
+        let (untouched, _, _) = truncate_pair(long(), None, params.as_ref(), 0).unwrap();
         assert_eq!(untouched, long());
 
-        let (shortened, _) = truncate_pair(long(), None, params.as_ref(), 2).unwrap();
+        let (shortened, _, _) = truncate_pair(long(), None, params.as_ref(), 2).unwrap();
         assert_eq!(shortened, make_tokens(7..13));
     }
 
     #[test]
     fn test_only_first() {
-        let (t1, t2) = truncate_pair(
+        let (t1, t2, _source) = truncate_pair(
             long(),
             Some(short()),
             params(7, TruncationStrategy::OnlyFirst).as_ref(),
@@ -293,7 +360,7 @@ mod tests {
 
     #[test]
     fn test_only_second() {
-        let (t1, t2) = truncate_pair(
+        let (t1, t2, _source) = truncate_pair(
             short(),
             Some(long()),
             params(7, TruncationStrategy::OnlySecond).as_ref(),
@@ -431,7 +498,7 @@ mod tests {
         expected1: &[u32],
         expected2: Option<&[u32]>,
     ) {
-        let (t1, t2) = truncate_pair(s1, s2, Some(&truncation), num_special_tokens).unwrap();
+        let (t1, t2, _source) = truncate_pair(s1, s2, Some(&truncation), num_special_tokens).unwrap();
 
         assert_eq!(t1, make_tokens(expected1.iter().copied()));
         assert_eq!(t2, expected2.map(|ids| make_tokens(ids.iter().copied())));
@@ -501,6 +568,131 @@ mod tests {
             3,
             &[3, 4],
             Some(&[3, 4, 5]),
+        );
+    }
+
+    fn source(
+        s1: Vec<PipelineToken>,
+        s2: Option<Vec<PipelineToken>>,
+        truncation: &Option<TruncationParams>,
+        num_special_tokens: usize,
+    ) -> TruncationSource {
+        truncate_pair(s1, s2, truncation.as_ref(), num_special_tokens)
+            .unwrap()
+            .2
+    }
+
+    // The marker says which segment lost tokens, not which strategy was asked for.
+    #[test]
+    fn test_source_marker() {
+        // No truncation configured: nothing cut.
+        assert_eq!(source(long(), None, &None, 0), TruncationSource::None);
+        // Input already fits: nothing cut.
+        assert_eq!(
+            source(short(), Some(short()), &params(7, TruncationStrategy::LongestFirst), 0),
+            TruncationSource::None
+        );
+        // Single sequence: the first (and only) segment is cut.
+        assert_eq!(
+            source(long(), None, &params(3, TruncationStrategy::LongestFirst), 0),
+            TruncationSource::First
+        );
+        // Pair where only the long first sequence is cut.
+        assert_eq!(
+            source(long(), Some(short()), &params(7, TruncationStrategy::LongestFirst), 0),
+            TruncationSource::First
+        );
+        // Pair where only the long second sequence is cut.
+        assert_eq!(
+            source(short(), Some(long()), &params(7, TruncationStrategy::LongestFirst), 0),
+            TruncationSource::Second
+        );
+        // Pair where both sequences are cut.
+        assert_eq!(
+            source(long(), Some(long()), &params(7, TruncationStrategy::LongestFirst), 0),
+            TruncationSource::Both
+        );
+        // Strategy names the segment to cut.
+        assert_eq!(
+            source(long(), Some(short()), &params(7, TruncationStrategy::OnlyFirst), 0),
+            TruncationSource::First
+        );
+        assert_eq!(
+            source(short(), Some(long()), &params(7, TruncationStrategy::OnlySecond), 0),
+            TruncationSource::Second
+        );
+    }
+
+    // `max_length == 0` empties whatever holds tokens; the marker still names the segments that
+    // lost something, and an already-empty segment does not count.
+    #[test]
+    fn test_source_marker_max_length_zero() {
+        let zero = params(0, TruncationStrategy::LongestFirst);
+
+        assert_eq!(source(long(), None, &zero, 0), TruncationSource::First);
+        assert_eq!(source(empty(), None, &zero, 0), TruncationSource::None);
+        assert_eq!(
+            source(long(), Some(long()), &zero, 0),
+            TruncationSource::Both
+        );
+        assert_eq!(
+            source(long(), Some(empty()), &zero, 0),
+            TruncationSource::First
+        );
+        assert_eq!(
+            source(empty(), Some(long()), &zero, 0),
+            TruncationSource::Second
+        );
+        assert_eq!(
+            source(empty(), Some(empty()), &zero, 0),
+            TruncationSource::None
+        );
+    }
+
+    // Special tokens eat into `max_length`, so a pair that fits without specials may truncate with
+    // them. The marker has to follow the actual cut, and the kept counts have to leave room for the
+    // specials the post-processor adds.
+    #[test]
+    fn test_source_marker_with_specials() {
+        // 2 + 2 = 4 tokens, max 6 with 2 specials => 4 to keep, no cut.
+        assert_eq!(
+            source(
+                short(),
+                Some(short()),
+                &params(6, TruncationStrategy::LongestFirst),
+                2
+            ),
+            TruncationSource::None
+        );
+        // 8 + 2 = 10 tokens, max 8 with 2 specials => 6 to keep: only the first sequence is cut.
+        assert_eq!(
+            source(
+                long(),
+                Some(short()),
+                &params(8, TruncationStrategy::LongestFirst),
+                2
+            ),
+            TruncationSource::First
+        );
+        // Same pair, max 7 with 2 specials => 5 to keep: still only the first sequence is cut.
+        assert_eq!(
+            source(
+                long(),
+                Some(short()),
+                &params(7, TruncationStrategy::LongestFirst),
+                2
+            ),
+            TruncationSource::First
+        );
+        // 4 + 4 = 8 tokens, max 8 with 3 specials => 5 to keep: both sequences are cut.
+        assert_eq!(
+            source(
+                medium(),
+                Some(medium()),
+                &params(8, TruncationStrategy::LongestFirst),
+                3
+            ),
+            TruncationSource::Both
         );
     }
 }

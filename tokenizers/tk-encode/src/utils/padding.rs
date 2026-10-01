@@ -105,12 +105,15 @@ fn pad_one(encoding: &mut Encoding, target_length: usize, params: &PaddingParams
         ids,
         type_ids: Some(type_ids),
         attention_mask: Some(attention_mask),
+        // Padding only appends tokens; it never changes which segment truncation cut into.
+        truncation_source: encoding.truncation_source,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TruncationSource;
 
     fn make_tokens(ids: impl IntoIterator<Item = u32>) -> Vec<PipelineToken> {
         ids.into_iter().map(PipelineToken::from).collect()
@@ -121,6 +124,7 @@ mod tests {
             ids: make_tokens(ids),
             type_ids: None,
             attention_mask: None,
+            truncation_source: TruncationSource::None,
         }
     }
 
@@ -207,6 +211,7 @@ mod tests {
             ids: make_tokens(0..3),
             type_ids: Some(vec![1, 1, 1]),
             attention_mask: None,
+            truncation_source: TruncationSource::None,
         }];
         let params = PaddingParams {
             strategy: PaddingStrategy::Fixed(5),
@@ -226,6 +231,7 @@ mod tests {
             ids: make_tokens(0..3),
             type_ids: Some(vec![1, 1, 1]),
             attention_mask: None,
+            truncation_source: TruncationSource::None,
         }];
         let params = PaddingParams {
             strategy: PaddingStrategy::Fixed(5),
