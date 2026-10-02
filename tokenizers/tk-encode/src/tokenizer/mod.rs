@@ -14,7 +14,7 @@ pub mod pipeline;
 // (and its `AddedToken`) and the whole serde load/save surface live in `tk-convert`. What
 // stays here is the vocabulary of traits every component implements, plus the input/output types
 // they are written against.
-pub use crate::decoders::{Decoder, DecoderRuntime};
+pub use crate::decoders::{Decoder, DecoderRuntime, FragmentBoundary, FragmentDecoder};
 pub use crate::utils::iter::LinesWithEnding;
 pub use crate::utils::padding::{PaddingDirection, PaddingParams, PaddingStrategy, pad_encodings};
 pub use crate::utils::truncation::{
